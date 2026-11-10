@@ -2,7 +2,7 @@
 
 - 合成入口：[脚本/merge_cpu_compute_latest.sh](脚本/merge_cpu_compute_latest.sh)
 - 合成实现：[脚本/merge_cpu_compute_trace.py](脚本/merge_cpu_compute_trace.py)
-- [参考profile：17:41 pipeline版](参考profile/README.md)
+- [参考profile：scale搬运修复版](参考profile/README.md)
 - [如何让agent合成profile：离线指令，整段复制即可](如何让agent合成profile.md)
 
 配套运行代码见 [Ascend CPU分支](https://github.com/yxk-fdu/vllm-ascend/tree/moe_cpu_compute_v1-on-0928)，当前启动与短采集步骤见 [脚本设定指南](../部署指南及参考脚本/脚本设定指南.md#验证与短-profile)。本仓库既保留 `cpu_moe/` 内的合成脚本，也在本目录的 `脚本/` 提供显式配对、校时和裁剪工具。
@@ -12,7 +12,7 @@
 
 目标是呈现下图这种 CPU 计算条形与 NPU 原始设备流并排阅读的效果，参考 `L4_E1_C1`，新增真实传输计数后为 `L4_E1_C1_T1`。截图用于说明展示方式；合成代码和图中重叠现象不构成模型正确性、计算精度或加速收益的证明。
 
-可下载查看的参考文件：[17:41 pipeline版合成profile](参考profile/README.md)。大文件以gzip保存，解压后为原始合成JSON。
+可下载查看的参考文件：[scale搬运修复版合成profile](参考profile/README.md)。大文件以gzip保存，解压后为原始合成JSON。
 
 原始文件备份在 `cpu_moe/`，原始参考入口相对于该目录为 `merge_cpu_compute_latest.sh`；`cpu_moe` 的绝对路径按实际环境确定。本目录的 `脚本/`保存加入校时和 T 标签的参考版本，原始包装器保存在 `profile合成指南/参考实现/merge_cpu_compute_latest.original.sh`。新包装器要求显式给出同次 trace、CPU 日志和校时锚点，避免 latest 指向其他运行。
 
