@@ -23,12 +23,12 @@
 | 组件 | 配套版本 |
 | --- | --- |
 | vLLM | **0.30.0**，实装 `0.30.0+empty`。 |
-| vllm-ascend | `moe_cpu_compute_v1-on-0928` 的共享 NZ 接入提交 [`9716ac1`](https://github.com/yxk-fdu/vllm-ascend/commit/9716ac1317d6088405c13a4adfc3c7003442835c)。 |
+| vllm-ascend | `moe_cpu_compute_v1-on-0928` 的共享 NZ 接入提交 [`d9ddc40`](https://github.com/yxk-fdu/vllm-ascend/commit/d9ddc405db763daeba5c70083b50f9a08a8514a7)。 |
 | CPU计算后端 | 从 [`db0d796` 的完整 `cpu_moe/`](https://github.com/yxk-fdu/cpu_moe_compute/tree/db0d79674096e4a883f1e2e5687baf441acb9ab1/cpu_moe) 为目标架构编译 kt-kernel，确认运行包导出 `NZMOE`。 |
 
-使用模型原有的 MXFP4 权重。Ascend 在加载时生成最终 NZ 权重和 scale，CPU 后端借用同一批 DMA 源缓冲。设置 `cpu_moe.weight_format="nz_mxfp4"`、`native_dispatch=true`、`threadpool_count=1`，并将 `weight_path` 留空。启动前设置 `KT_MOE_MATCH_NPU_MXFP8=1`，并将 `KT_MOE_POLL_LIBRARY` 指向配套运行包的 `libkt_ready_poll.so`。计算线程与 DMA 源内存放在同一 NUMA 节点。配置和调用流程见 [Ascend 共享 NZ 指南](https://github.com/yxk-fdu/vllm-ascend/blob/moe_cpu_compute_v1-on-0928/docs/host_hybrid_cpu_lrc_dma.md#shared-nz-cpu-weights)。
+使用模型原有的 MXFP4 权重。Ascend 在加载时生成最终 NZ 权重和 scale，CPU 后端借用同一批 DMA 源缓冲。设置 `cpu_moe.weight_format="nz_mxfp4"`、`native_dispatch=true`、`threadpool_count=1`，并将 `weight_path` 留空。启动前设置 `KT_MOE_MATCH_NPU_MXFP8=1`。原生派发通过 CPU 后端的 C++ 接口启动。计算线程与 DMA 源内存放在同一 NUMA 节点。配置和调用流程见 [Ascend 共享 NZ 指南](https://github.com/yxk-fdu/vllm-ascend/blob/moe_cpu_compute_v1-on-0928/docs/host_hybrid_cpu_lrc_dma.md#shared-nz-cpu-weights)。
 
-这组 Ascend 原生派发配对适用于 **x86 主机**。ARM CPU 后端已有共享 NZ 内核，当前 Ascend 的原生 NPU→CPU 派发仍要求 x86。
+这组共享 NZ 配对支持 x86。ARM 原生派发和映射回传已在 Ascend 950DT、CANN 9.2.1 上通过 1 和 8 token 实卡小图回归。
 
 ### 历史 GGUF 配对
 
