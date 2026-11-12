@@ -8,7 +8,7 @@
 | [部署指南及参考脚本/](部署指南及参考脚本/) | 仅保留[参考启动脚本](部署指南及参考脚本/参考启动脚本.sh)、[脚本设定指南](部署指南及参考脚本/脚本设定指南.md)、[权重准备指南](部署指南及参考脚本/权重准备指南.md)。 |
 | [profile合成指南/](profile合成指南/) | CPU/NPU日志采集、时钟对齐、合成脚本和样例。需要分析profile时使用；[复制agent合成指令](profile合成指南/如何让agent合成profile.md)，默认只下载最终JSON到本地桌面。 |
 
-普通CPU计算入口：[cpu_moe/普通CPU计算.sh](cpu_moe/普通CPU计算.sh)，单卡BS1，**不开DSpark、不开下一层专家预取**；参数沿用153此前跑通的配置。
+历史 GGUF 启动脚本 [cpu_moe/普通CPU计算.sh](cpu_moe/普通CPU计算.sh) 沿用 153 的单卡 BS1 配置，关闭 DSpark 和下一层专家预取。
 
 ## 下载什么
 
@@ -26,7 +26,7 @@
 | vllm-ascend | `moe_cpu_compute_v1-on-0928` 的共享 NZ 接入提交 [`9716ac1`](https://github.com/yxk-fdu/vllm-ascend/commit/9716ac1317d6088405c13a4adfc3c7003442835c)。 |
 | CPU计算后端 | 从 [`db0d796` 的完整 `cpu_moe/`](https://github.com/yxk-fdu/cpu_moe_compute/tree/db0d79674096e4a883f1e2e5687baf441acb9ab1/cpu_moe) 为目标架构编译 kt-kernel，确认运行包导出 `NZMOE`。 |
 
-使用模型原有的 MXFP4 权重。Ascend 在加载时生成最终 NZ 权重和 scale，CPU 后端借用同一批 DMA 源缓冲。设置 `cpu_moe.weight_format="nz_mxfp4"`、`native_dispatch=true`、`threadpool_count=1`，并将 `weight_path` 留空。计算线程与 DMA 源内存放在同一 NUMA 节点。配置和调用流程见 [Ascend 共享 NZ 指南](https://github.com/yxk-fdu/vllm-ascend/blob/9716ac1317d6088405c13a4adfc3c7003442835c/docs/host_hybrid_cpu_lrc_dma.md#shared-nz-cpu-weights)。
+使用模型原有的 MXFP4 权重。Ascend 在加载时生成最终 NZ 权重和 scale，CPU 后端借用同一批 DMA 源缓冲。设置 `cpu_moe.weight_format="nz_mxfp4"`、`native_dispatch=true`、`threadpool_count=1`，并将 `weight_path` 留空。启动前设置 `KT_MOE_MATCH_NPU_MXFP8=1`，并将 `KT_MOE_POLL_LIBRARY` 指向配套运行包的 `libkt_ready_poll.so`。计算线程与 DMA 源内存放在同一 NUMA 节点。配置和调用流程见 [Ascend 共享 NZ 指南](https://github.com/yxk-fdu/vllm-ascend/blob/moe_cpu_compute_v1-on-0928/docs/host_hybrid_cpu_lrc_dma.md#shared-nz-cpu-weights)。
 
 这组 Ascend 原生派发配对适用于 **x86 主机**。ARM CPU 后端已有共享 NZ 内核，当前 Ascend 的原生 NPU→CPU 派发仍要求 x86。
 
