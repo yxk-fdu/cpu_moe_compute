@@ -27,6 +27,7 @@
 #include "cpu_backend/ascend_callback_worker.h"
 #endif
 #include "operators/common.hpp"
+#include "operators/llamafile/nz_moe.hpp"
 
 #if defined(USE_MOE_KERNEL)
 #include "operators/moe_kernel/la/kernel.hpp"
@@ -841,6 +842,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   py::class_<MoE_Interface, std::shared_ptr<MoE_Interface>>(moe_module, "MoE_Interface");
 
   bind_moe_module<LLAMA_MOE_TP>(moe_module, "MOE");
+  py::class_<kt_nz::MoE, std::shared_ptr<kt_nz::MoE>>(moe_module, "NZMOE")
+      .def(py::init<WorkerPool&, int, int, int, int, int, std::vector<std::vector<uintptr_t>>>(), py::keep_alive<1, 2>())
+      .def("forward_task", &kt_nz::MoE::forward_task)
+      .def("weight_pointers", &kt_nz::MoE::weight_pointers);
+
 
 #if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
   bind_moe_module<AMX_MOE_TP<amx::GemmKernel224Int8>>(moe_module, "AMXInt8_MOE");

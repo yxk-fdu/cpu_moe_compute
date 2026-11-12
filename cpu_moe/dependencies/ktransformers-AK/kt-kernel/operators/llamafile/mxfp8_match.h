@@ -9,22 +9,24 @@
 #include <immintrin.h>
 #endif
 namespace kt_match_npu {
+inline bool matching_requested() {
+ static const bool value = std::getenv("KT_MOE_MATCH_NPU_MXFP8") != nullptr;
+ return value;
+}
 inline bool enabled() {
 #if defined(__aarch64__)
  // ARM uses the existing GGUF MXFP4 x Q8_0 llama.cpp path, regardless
  // of the launch environment. Keep the original x86 matching behavior.
  return false;
 #else
- static const bool value = std::getenv("KT_MOE_MATCH_NPU_MXFP8") != nullptr;
- return value;
+ return matching_requested();
 #endif
 }
 inline float bf16(float x) {
  uint32_t u; std::memcpy(&u,&x,4); u += 0x7fff + ((u >> 16) & 1); u &= 0xffff0000u;
  std::memcpy(&x,&u,4); return x;
 }
-inline void quant_dequant(float* values, int count) {
- if (!enabled()) return;
+inline void quant_dequant_mxfp8(float* values, int count) {
  for (int base=0; base<count; base+=32) {
   int end=std::min(base+32,count); float maximum=0;
   for(int i=base;i<end;++i) maximum=std::max(maximum,std::fabs(values[i]));
@@ -38,6 +40,9 @@ inline void quant_dequant(float* values, int count) {
    values[i]=std::copysign(q*scale,values[i]);
   }
  }
+}
+inline void quant_dequant(float* values, int count) {
+ if (enabled()) quant_dequant_mxfp8(values, count);
 }
 inline float dot_gguf_mxfp4_mxfp8(const uint8_t* weights, const float* input, int blocks) {
  static const int8_t table_values[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
