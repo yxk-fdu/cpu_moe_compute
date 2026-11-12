@@ -10,7 +10,11 @@
 | [dependencies/ktransformers-AK/third_party/](dependencies/ktransformers-AK/third_party) | 后端构建所用第三方源码和许可证。 |
 | `merge_cpu_compute_latest.sh` / `merge_cpu_compute_trace.py` | CPU/NPU日志合成参考实现。当前使用入口见独立的profile合成指南。 |
 
-## ARM 与 x86 的执行路径
+## 共享 NZ 执行路径
+
+选择 `weight_format="nz_mxfp4"` 时，Ascend 将最终 NZ 权重和 scale 的 Tensor 所有者交给本目录的 `NZMoEWrapper`。C++ `NZMOE` 和 Ascend 原生 DMA 使用同一批地址。CPU 后端按专家分组并复用重复选中专家的解包结果。此路径使用模型原有权重，按 [共享 NZ 配对说明](../README.md#共享-nz-配对) 编译和配置。
+
+## 历史 GGUF 的 ARM 与 x86 执行路径
 
 以下说明针对 `weight_format="gguf"` 的 MXFP4 路由专家。两种架构读取的权重均为 MXFP4；区别在于输入激活的量化方式和实际点积内核。GGUF 是文件容器，不能据此推断整个模型都是同一种精度。
 
@@ -62,7 +66,7 @@ env KT_MOE_MATCH_NPU_MXFP8=1 /tmp/test_mxfp8_arch_policy
 
 脚本不传DSpark推测配置，`expert_prefetch_enabled=false`。`--safetensors-load-strategy prefetch` 仅为启动时checkpoint文件预读，不是下一层专家预取。迁移时通过 `WORKSPACE`、`ASCEND_REPO`、`KT_BUILD`、`MODEL_PATH`、`GGUF_PATH`、`LOG_ROOT` 指定路径；`NPU`和`PORT`可覆盖默认值。安装与其他关键参数见 [脚本设定指南](../部署指南及参考脚本/脚本设定指南.md)。
 
-## 与153已验证环境的对应关系
+## 与153已验证 GGUF 环境的对应关系
 
 153已完成整模型启动、推理和性能测试；CPU运行包为 `kt-native-profile-package`，计算采用GGUF，参考成本 **93.16 μs / expert-token（约90 μs）**。
 
