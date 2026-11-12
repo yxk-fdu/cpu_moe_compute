@@ -99,6 +99,19 @@ inline float reduce256(VecF32 lo, VecF32 hi) {
     return arm::reduce({vld1q_f32(lanes),vld1q_f32(lanes+4),vld1q_f32(lanes+8),vld1q_f32(lanes+12)});
 }
 
+inline float reduce256_single_token(VecF32 lo, VecF32 hi) {
+    // Keep the same pairwise addition tree as arm::reduce.
+    const auto all = svptrue_b32();
+    auto eight = svadd_f32_x(all, hi, lo);
+    asm volatile("" : "+w"(eight));
+    auto four = svadd_f32_x(all, svext_f32(eight, eight, 4), eight);
+    asm volatile("" : "+w"(four));
+    auto two = svadd_f32_x(all, svext_f32(four, four, 2), four);
+    asm volatile("" : "+w"(two));
+    const auto sum = svadd_f32_x(all, two, svext_f32(two, two, 1));
+    return svlastb_f32(svptrue_pat_b32(SV_VL1), sum);
+}
+
 
 template<int Tokens>
 void project_rows(const uint8_t* weights,const uint8_t* scales,int n,int groups,int first,int rows,
@@ -137,8 +150,13 @@ void project_rows(const uint8_t* weights,const uint8_t* scales,int n,int groups,
             sums[row]=acc;
         }
     }
-    for (int r=0;r<rows;++r)
-        for (int t=0;t<Tokens;++t) y[t][r]=reduce256(sums[r].lo[t],sums[r].hi[t]);
+    for (int r=0;r<rows;++r) {
+        if constexpr (Tokens == 1) {
+            y[0][r] = reduce256_single_token(sums[r].lo[0], sums[r].hi[0]);
+        } else {
+            for (int t=0;t<Tokens;++t) y[t][r]=reduce256(sums[r].lo[t],sums[r].hi[t]);
+        }
+    }
 }
 }  // namespace
 
