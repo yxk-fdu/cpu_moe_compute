@@ -24,7 +24,7 @@
 | --- | --- |
 | vLLM | **0.30.0**，实装 `0.30.0+empty`。 |
 | vllm-ascend | `moe_cpu_compute_v1-on-0928` 的共享 NZ 接入提交 [`d9ddc40`](https://github.com/yxk-fdu/vllm-ascend/commit/d9ddc405db763daeba5c70083b50f9a08a8514a7)。 |
-| CPU计算后端 | 从 [`db0d796` 的完整 `cpu_moe/`](https://github.com/yxk-fdu/cpu_moe_compute/tree/db0d79674096e4a883f1e2e5687baf441acb9ab1/cpu_moe) 为目标架构编译 kt-kernel，确认运行包导出 `NZMOE`。 |
+| CPU计算后端 | 用本仓库的完整 [`cpu_moe/`](cpu_moe/) 为目标架构编译 kt-kernel，确认运行包导出 `NZMOE`。共享 NZ 内核基线为 [`db0d796`](https://github.com/yxk-fdu/cpu_moe_compute/commit/db0d79674096e4a883f1e2e5687baf441acb9ab1)，当前构建脚本还包含 ARM 轮询库编译修复。 |
 
 使用模型原有的 MXFP4 权重。Ascend 在加载时生成最终 NZ 权重和 scale，CPU 后端借用同一批 DMA 源缓冲。设置 `cpu_moe.weight_format="nz_mxfp4"`、`native_dispatch=true`、`threadpool_count=1`，并将 `weight_path` 留空。启动前设置 `KT_MOE_MATCH_NPU_MXFP8=1`。原生派发通过 CPU 后端的 C++ 接口启动。计算线程与 DMA 源内存放在同一 NUMA 节点。配置和调用流程见 [Ascend 共享 NZ 指南](https://github.com/yxk-fdu/vllm-ascend/blob/moe_cpu_compute_v1-on-0928/docs/host_hybrid_cpu_lrc_dma.md#shared-nz-cpu-weights)。
 
@@ -36,7 +36,7 @@
 | --- | --- |
 | vLLM | **0.30.0**，实装 `0.30.0+empty`，使用同一实验构建。 |
 | vllm-ascend | 固定提交 [`7cf63ca`](https://github.com/yxk-fdu/vllm-ascend/commit/7cf63ca477bf6045ad5a262ff6d59b66ace463bd)。 |
-| CPU计算后端 | 固定标签 [`cpu-moe-153-20261109-r2`](https://github.com/yxk-fdu/cpu_moe_compute/tree/cpu-moe-153-20261109-r2/cpu_moe)，校验清单见 [cpu_moe/version.json](cpu_moe/version.json)。 |
+| CPU计算后端 | 固定标签 [`cpu-moe-153-20261109-r2`](https://github.com/yxk-fdu/cpu_moe_compute/tree/cpu-moe-153-20261109-r2/cpu_moe)，校验清单见 [该标签的 version.json](https://github.com/yxk-fdu/cpu_moe_compute/blob/cpu-moe-153-20261109-r2/cpu_moe/version.json)。 |
 
 历史 GGUF 配对已在 **153服务器完成整模型启动、推理和性能测试**，覆盖单卡 BS1、DSpark 关闭/7 及下一层预取关闭/开启。CPU 参考成本为 **93.16 μs / expert-token**，对应 GGUF 内核。
 

@@ -70,7 +70,7 @@ env KT_MOE_MATCH_NPU_MXFP8=1 /tmp/test_mxfp8_arch_policy
 
 153已完成整模型启动、推理和性能测试；CPU运行包为 `kt-native-profile-package`，计算采用GGUF，参考成本 **93.16 μs / expert-token（约90 μs）**。
 
-本目录kt-kernel和Python/C运行时源码已从153实测工作区直接同步，包含原生派发接口、动态profile开关、MXFP4复用及MXFP8匹配相关实现。153 同步基线的架构策略已按上文增加 ARM GGUF 派发规则；当前纳入范围的文件校验值保存在 [version.json](version.json)，运行库、权重、日志、测试/benchmark及依赖自带Markdown不在该校验范围，第三方依赖源码也已对照153补齐并纳入校验。
+历史 GGUF 配对的源码来自 153 实测工作区，包含原生派发接口、动态 profile 开关、MXFP4 复用和 MXFP8 匹配。该快照的源码校验值见 [历史标签的 version.json](https://github.com/yxk-fdu/cpu_moe_compute/blob/cpu-moe-153-20261109-r2/cpu_moe/version.json)。
 
 固定配对：本仓库标签 [`cpu-moe-153-20261109-r2`](https://github.com/yxk-fdu/cpu_moe_compute/tree/cpu-moe-153-20261109-r2/cpu_moe) ↔ Ascend提交 [`7cf63ca`](https://github.com/yxk-fdu/vllm-ascend/commit/7cf63ca477bf6045ad5a262ff6d59b66ace463bd)，vLLM `0.30.0+empty`。**两边都要准备，缺一不可。** 本版本已集成原生派发接口，无需额外接口补丁。
 
