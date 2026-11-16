@@ -9,7 +9,7 @@ BUILD=${1:?Usage: build_ascend_cpu_moe.sh /absolute/new/build/directory}
 command -v cmake >/dev/null
 command -v pkg-config >/dev/null
 pkg-config --exists hwloc
-python -c 'import torch,torch_npu,pybind11,numpy,safetensors,gguf'
+python -c 'import torch,torch_npu,pybind11,numpy,safetensors'
 [[ -f "$SRC/../third_party/llama.cpp/CMakeLists.txt" && -f "$SRC/../third_party/pybind11/CMakeLists.txt" ]] || {
   echo 'Initialize third_party/llama.cpp and third_party/pybind11 first' >&2; exit 2;
 }
@@ -30,9 +30,6 @@ shutil.copytree(src/'python',package,ignore=shutil.ignore_patterns('*.so','__pyc
 ext='kt_kernel_ext'+sysconfig.get_config_var('EXT_SUFFIX')
 shutil.copy2(build/'cmake'/ext,package/ext)
 PY
-cc -shared -fPIC -O2 -pthread "$SRC/python/native_ready_poll.c" \
-  -o "$BUILD/package/kt_kernel/libkt_ready_poll.so"
 export PYTHONPATH="$BUILD/package:${PYTHONPATH:-}"
-python -c 'import torch,torch_npu,kt_kernel; print(kt_kernel.__file__); print(kt_kernel.kt_kernel_ext.__file__); assert hasattr(kt_kernel.kt_kernel_ext,"launch_no_block_callback")'
+python -c 'import torch,torch_npu,kt_kernel; print(kt_kernel.__file__); print(kt_kernel.kt_kernel_ext.__file__); ext=kt_kernel.kt_kernel_ext; assert hasattr(ext.moe,"NZMOE"); assert all(hasattr(ext,name) for name in ("native_dispatch_api","native_cpu_handle","available_worker_pool_cpus")); assert hasattr(ext.WorkerPoolConfig(),"subpool_cpus")'
 echo "KT_BUILD=$BUILD/package"
-echo "KT_MOE_POLL_LIBRARY=$BUILD/package/kt_kernel/libkt_ready_poll.so"

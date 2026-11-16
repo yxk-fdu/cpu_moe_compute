@@ -541,11 +541,14 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
         "True iff the ACL callback worker is started and ready to process reports.");
 #endif
   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
+  m.def("resolve_worker_pool_cpus", &resolve_worker_pool_cpus);
+  m.def("available_worker_pool_cpus", &available_worker_pool_cpus);
   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
       .def(py::init<>())
       .def_readwrite("subpool_count", &WorkerPoolConfig::subpool_count)
       .def_readwrite("subpool_numa_map", &WorkerPoolConfig::subpool_numa_map)
-      .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count);
+      .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count)
+      .def_readwrite("subpool_cpus", &WorkerPoolConfig::subpool_cpus);
 
   py::class_<CPUInfer>(m, "CPUInfer")
       .def(py::init<int>())

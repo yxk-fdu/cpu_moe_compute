@@ -13,7 +13,6 @@ import numpy as np
 import torch
 from enum import IntEnum
 from safetensors import safe_open
-from gguf.gguf_reader import GGUFReader
 
 
 class GGMLQuantizationType(IntEnum):
@@ -907,6 +906,8 @@ class GGUFLoader:
 
     def _load_single_file(self, file_path: str):
         """Load a single GGUF file"""
+        from gguf.gguf_reader import GGUFReader
+
         reader = GGUFReader(file_path)
 
         for key, field in reader.fields.items():
@@ -933,6 +934,8 @@ class GGUFLoader:
 
     def _load_directory(self, dir_path: str):
         """Load all GGUF files from a directory (non-recursive)"""
+        from gguf.gguf_reader import GGUFReader
+
         found_gguf = False
 
         for file in sorted(os.listdir(dir_path)):

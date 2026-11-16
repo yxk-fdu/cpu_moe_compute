@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # 153普通CPU MoE：单卡BS1，CPU计算开启，DSpark和下一层预取均关闭。
-# 模型、GGUF、NUMA和线程参数沿用153跑通的配置；路径可通过环境变量替换。
+# 共享 NZ 单卡配置，部署前按实际机器配置 NUMA 和线程数。
 set -o pipefail
 if [[ -f "$HOME/.bashrc" ]]; then source "$HOME/.bashrc"; fi
 WORKSPACE=${WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 ASCEND_REPO=${ASCEND_REPO:-$WORKSPACE/vllm-ascend}
 MODEL_PATH=${MODEL_PATH:-/data/libvirt/images/weights/DeepSeek-V4-Flash-0731}
-GGUF_PATH=${GGUF_PATH:-'/data/libvirt/images/weights/gguf_cache/dsv4_layer{layer_idx}_mxfp4.gguf'}
 
 CARDS=${NPU:-4}
 PORT=${PORT:-8144}
@@ -36,23 +35,16 @@ if ! python3 -c "import acl" >/dev/null 2>&1; then
     echo "[env] source CANN"
 fi
 
-KT_BUILD=${KT_BUILD:-$WORKSPACE/cpu_moe/kt-native-profile-package}
+KT_BUILD=${KT_BUILD:?Set KT_BUILD to the built shared NZ package directory}
 export KT_MOE_MATCH_NPU_MXFP8=1
 export KT_MOE_MXFP4_TOKEN_REUSE=0
 export KT_GROUP_MIN_LEN=10
 
 export KT_MOE_PIN_WEIGHTS=1
-export KT_MOE_CORE_OFFSET=0
 
-export KT_MOE_POLL_SUBMIT=1
-export KT_MOE_POLL_CPU=62
-export KT_MOE_COMPLETION_CPU=63
 export KT_MOE_COMPLETION_RT_PRIORITY=0
 export KT_MOE_COMPLETION_SPIN_US=3000
-export KT_MOE_POLL_LIBRARY=$KT_BUILD/kt_kernel/libkt_ready_poll.so
-unset KT_MOE_POLL_TRACE
 unset KT_MOE_RT_PRIORITY  # Continuous FIFO triggered RT throttling; pending refinement.
-echo "[cpu-moe] NUMA=1 workers_expected=32-61 poll=$KT_MOE_POLL_CPU completion=$KT_MOE_COMPLETION_CPU completion_rt=$KT_MOE_COMPLETION_RT_PRIORITY spin_us=$KT_MOE_COMPLETION_SPIN_US"
 
 if [ "${CPU_MOE_PHASE_TRACE:-1}" = "1" ]; then
     export KT_MOE_CPU_TRACE="$PROF_RAW_DIR/cpu_compute_%p.jsonl"
@@ -118,6 +110,18 @@ PROFILER_CONFIG=$(cat <<JSON
 JSON
 )
 
+# Unset overrides are JSON null, so the worker sizes the CPU MoE pool.
+for name in CPU_THREADS NUMA_NODE HOST_WEIGHT_NUMA_NODE DMA_CPU; do
+    if [[ -n ${!name:-} && ! ${!name:-} =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "$name must be a non-negative integer" >&2
+        exit 2
+    fi
+done
+CPU_MOE_NUMA_NODES=null
+if [[ -n ${NUMA_NODE:-} ]]; then
+    CPU_MOE_NUMA_NODES="[$NUMA_NODE]"
+fi
+
 ADDITIONAL_CONFIG=$(cat <<JSON
 {
     "enable_cpu_binding": false,
@@ -140,27 +144,16 @@ ADDITIONAL_CONFIG=$(cat <<JSON
         "moe_offload_debug": $MOE_DEBUG,
         "cpu_moe": {
             "enabled": true,
-      "native_dispatch": true,
-      "native_dispatch_dma_cpu": 127,
-      "host_weight_numa_node": 0,
-            "backend": "kt_kernel",
-            "transfer_policy": "load_balance",
+            "host_weight_numa_node": ${HOST_WEIGHT_NUMA_NODE:-null},
+            "native_dispatch_dma_cpu": ${DMA_CPU:-null},
             "balance_max_transfers": 32,
-            "balance_cpu_expert_us": 93.16,
-            "balance_cpu_extra_route_us": 93.16,
-            "balance_copy_us": 275.828,
             "balance_npu_route_us": 2.0,
             "balance_npu_fixed_us": 200.0,
             "balance_min_gain_us": 20.0,
-            "transfer_scheduler": "cpu",
-            "transfer_copy_library": "$ASCEND_REPO/vllm_ascend/expert_offload/lib/libnpu_expert_copy_dispatch.so",
-            "weight_format": "gguf",
-            "weight_path": "$GGUF_PATH",
-            "layers": "all",
             "max_num_tokens": 48,
-            "cpuinfer_threads": 30,
+            "cpuinfer_threads": ${CPU_THREADS:-null},
             "threadpool_count": 1,
-            "numa_nodes": [1]
+            "numa_nodes": $CPU_MOE_NUMA_NODES
         }
     }
 }
@@ -168,7 +161,7 @@ JSON
 )
 
 ulimit -l unlimited
-exec numactl --cpunodebind=1 --preferred=1 vllm serve "$MODEL_PATH" \
+exec vllm serve "$MODEL_PATH" \
     --host 0.0.0.0 \
     --port "$PORT" \
     --data-parallel-size 1 \

@@ -28,10 +28,18 @@
 // #define PROFILE_BALANCE
 
 inline void set_to_numa(int this_numa) {
-  struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
+  struct bitmask* mask = numa_allocate_nodemask();
   numa_bitmask_setbit(mask, this_numa);
   numa_bind(mask);
   numa_bitmask_free(mask);
+}
+
+inline hwloc_obj_t get_numa_node(hwloc_topology_t topology, int os_index) {
+  hwloc_obj_t node = nullptr;
+  while ((node = hwloc_get_next_obj_by_type(topology, HWLOC_OBJ_NUMANODE, node))) {
+    if (node->os_index == static_cast<unsigned>(os_index)) return node;
+  }
+  return nullptr;
 }
 
 inline void set_memory_to_numa(int this_numa) {
@@ -40,7 +48,7 @@ inline void set_memory_to_numa(int this_numa) {
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
 
-  hwloc_obj_t obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, this_numa);
+  hwloc_obj_t obj = get_numa_node(topology, this_numa);
   if (!obj) {
     fprintf(stderr, "NUMA node %d not found.\n", this_numa);
     hwloc_topology_destroy(topology);
@@ -78,7 +86,7 @@ struct alignas(64) ThreadState {
 class InNumaPool {
  public:
   InNumaPool(int thread_count);
-  InNumaPool(int max_thread_num, int numa_id, int threads_id_start);
+  InNumaPool(const std::vector<int>& cpus, int numa_id, int threads_id_start);
   ~InNumaPool();
   int get_thread_num();
   void set_restricted_worker_count(int count);
@@ -112,6 +120,7 @@ class InNumaPool {
 #endif
 
   void process_tasks(int);
+  void stop_workers();
   void worker_thread(int, int);
 };
 
@@ -119,7 +128,7 @@ class NumaJobDistributor {
  public:
   NumaJobDistributor(int numa_count);
   NumaJobDistributor(std::vector<int> numa_ids);
-  NumaJobDistributor(std::vector<int> numa_ids, std::vector<int> thread_count);
+  NumaJobDistributor(std::vector<int> numa_ids, const std::vector<std::vector<int>>& pool_cpus);
 
   ~NumaJobDistributor();
 
@@ -127,7 +136,8 @@ class NumaJobDistributor {
 
  private:
   void init(std::vector<int> numa_ids);
-  void init(std::vector<int> numa_ids, std::vector<int> thread_count);
+  void init(std::vector<int> numa_ids, const std::vector<std::vector<int>>& pool_cpus);
+  void stop_workers();
 
   std::unique_ptr<std::barrier<>> ready_bar;
 
@@ -146,7 +156,12 @@ struct WorkerPoolConfig {
   int subpool_count;
   std::vector<int> subpool_numa_map;
   std::vector<int> subpool_thread_count;
+  std::vector<std::vector<int>> subpool_cpus;
 };
+
+std::vector<std::vector<int>> resolve_worker_pool_cpus(const std::vector<int>& numa_nodes,
+                                                        const std::vector<int>& thread_counts);
+std::vector<std::vector<int>> available_worker_pool_cpus(const std::vector<int>& numa_nodes);
 
 class WorkerPool {
  public:

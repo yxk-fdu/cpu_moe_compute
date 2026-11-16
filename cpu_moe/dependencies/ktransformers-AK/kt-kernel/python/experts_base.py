@@ -426,6 +426,7 @@ class _MoEBase:
     """
 
     _cpu_infer_instance = None
+    _cpu_infer_config = None
 
     @classmethod
     def _get_cpu_infer(
@@ -433,6 +434,7 @@ class _MoEBase:
         cpuinfer_threads: int,
         threadpool_count: int,
         numa_nodes=None,
+        compute_cpus=(),
     ):
         """
         Get or create the CPUInfer singleton instance.
@@ -445,33 +447,37 @@ class _MoEBase:
         Returns:
             CPUInfer singleton instance
         """
-        if cls._cpu_infer_instance is None:
-            try:
-                if torch.npu.is_available():  # type: ignore[attr-defined]
-                    _ensure_ascend_callback_worker()
-            except Exception:
-                pass
-            worker_config = kt_kernel_ext.WorkerPoolConfig()
+        if threadpool_count <= 0 or cpuinfer_threads < threadpool_count:
+            raise ValueError("CPUInfer needs at least one thread per NUMA subpool")
+        subpool_numa_map = tuple(range(threadpool_count)) if numa_nodes is None else tuple(numa_nodes)
+        if len(subpool_numa_map) != threadpool_count:
+            raise ValueError(f"numa_nodes length ({len(subpool_numa_map)}) must match threadpool_count ({threadpool_count})")
+        threads, extra = divmod(cpuinfer_threads, threadpool_count)
+        subpool_thread_count = tuple(threads + (i < extra) for i in range(threadpool_count))
+        compute_cpus = tuple(tuple(pool) for pool in compute_cpus)
+        config = (subpool_numa_map, subpool_thread_count, compute_cpus)
 
-            if numa_nodes is not None:
-                if len(numa_nodes) != threadpool_count:
-                    raise ValueError(
-                        f"numa_nodes length ({len(numa_nodes)}) must match "
-                        f"threadpool_count ({threadpool_count})"
-                    )
-                subpool_numa_map = list(numa_nodes)
-            else:
-                subpool_numa_map = list(range(threadpool_count))
-            subpool_thread_count = [
-                cpuinfer_threads // threadpool_count + (1 if i < cpuinfer_threads % threadpool_count else 0)
-                for i in range(threadpool_count)
-            ]
+        if cls._cpu_infer_instance is not None:
+            if config != cls._cpu_infer_config:
+                raise ValueError(
+                    f"CPUInfer already uses NUMA nodes, thread counts and placement {cls._cpu_infer_config}; "
+                    f"requested {config}"
+                )
+            return cls._cpu_infer_instance
 
-            worker_config.subpool_count = threadpool_count
-            worker_config.subpool_numa_map = subpool_numa_map
-            worker_config.subpool_thread_count = subpool_thread_count
-            cls._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
-
+        try:
+            if torch.npu.is_available():  # type: ignore[attr-defined]
+                _ensure_ascend_callback_worker()
+        except Exception:
+            pass
+        worker_config = kt_kernel_ext.WorkerPoolConfig()
+        worker_config.subpool_count = threadpool_count
+        worker_config.subpool_numa_map = list(subpool_numa_map)
+        worker_config.subpool_thread_count = list(subpool_thread_count)
+        if compute_cpus:
+            worker_config.subpool_cpus = [list(pool) for pool in compute_cpus]
+        cls._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
+        cls._cpu_infer_config = config
         return cls._cpu_infer_instance
 
     @staticmethod
@@ -525,6 +531,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
+        compute_cpus: tuple[tuple[int, ...], ...] = (),
     ):
         """
         Initialize base MoE Wrapper.
@@ -578,7 +585,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.method = method
 
         # Initialize CPU inference engine (singleton via shared base class)
-        self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)
+        self.cpu_infer = self._get_cpu_infer(
+            cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes, compute_cpus=compute_cpus,
+        )
 
         # Backend-specific initialization happens in subclasses
         self.moe = None

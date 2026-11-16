@@ -1,10 +1,9 @@
 CPU MoE 脚本入口（整理于2026-10-26）
 
-日常服务只使用顶层三个入口，原参数和内容均保留：
-  run_dpark_npu0.sh  卡0，dspark
-  run_dpark.sh       卡7，dspark
-  run_cpu_moe.sh     卡7，非dspark入口
-卡号/端口以脚本当前内容为准；此清理没有启动、停止或重启服务。
+共享 NZ 启动入口：
+  普通CPU计算.sh
+  ../部署指南及参考脚本/参考启动脚本.sh
+配套版本、模型和权重见 README.md。卡号和端口以启动配置为准。
 
 常用工具：
   tools/benchmark/aisbench_with_stats.sh   包装ais_bench并收集统计
@@ -22,6 +21,6 @@ CPU MoE 脚本入口（整理于2026-10-26）
 合成profile请使用tools/profiling中的Python工具并显式传入trace和CPU log。
 host_tools不要作为当前服务的常规启动入口；旧配置未在本次清理中执行或修改。
 
-模型、GGUF、kt_async_runtime、dependencies、profiling数据、日志、expert_rank_gsm8k.json均保留。
+模型、kt_async_runtime、dependencies、profiling数据、日志、expert_rank_gsm8k.json均保留。
 irqbalance_policy.d仍被宿主机irqbalance引用，原位置保留。
 完整整理前原件保存在归档内original_top_level_files.tar.gz；manifest.json记录每个旧/新路径与SHA。

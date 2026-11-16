@@ -19,7 +19,12 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <future>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <map>
 
 #include "hwloc.h"
@@ -34,8 +39,7 @@ int moe_core_index(int relative_index) {
     char* end = nullptr;
     const long n = std::strtol(value, &end, 10);
     if (end == value || *end || n < 0 || n > 4096) {
-      fprintf(stderr, "[KT_MOE_AFFINITY] invalid KT_MOE_CORE_OFFSET=%s\n", value);
-      std::abort();
+      throw std::invalid_argument("KT_MOE_CORE_OFFSET must be an integer in [0, 4096]");
     }
     fprintf(stderr, "[KT_MOE_AFFINITY] core_offset=%ld\n", n);
     return int(n);
@@ -48,17 +52,15 @@ void configure_moe_realtime(pthread_t thread, const char* role) {
   char* end = nullptr;
   const long priority = std::strtol(value, &end, 10);
   if (*end || priority < sched_get_priority_min(SCHED_FIFO) || priority > sched_get_priority_max(SCHED_FIFO)) {
-    fprintf(stderr, "[KT_MOE_RT] invalid KT_MOE_RT_PRIORITY=%s\n", value);
-    std::abort();
+    throw std::invalid_argument("Invalid KT_MOE_RT_PRIORITY: " + std::string(value));
   }
   sched_param param{}; param.sched_priority = int(priority);
   int rc = pthread_setschedparam(thread, SCHED_FIFO, &param);
   int policy = 0; sched_param actual{};
   if (!rc) rc = pthread_getschedparam(thread, &policy, &actual);
   if (rc || policy != SCHED_FIFO || actual.sched_priority != priority) {
-    fprintf(stderr, "[KT_MOE_RT] role=%s failed: %s (policy=%d priority=%d)\n",
-            role, rc ? strerror(rc) : "verification mismatch", policy, actual.sched_priority);
-    std::abort();
+    throw std::runtime_error("Cannot set requested SCHED_FIFO for " + std::string(role) +
+                             ": " + (rc ? strerror(rc) : "verification mismatch"));
   }
   fprintf(stderr, "[KT_MOE_RT] role=%s policy=SCHED_FIFO priority=%ld verified=true\n", role, priority);
 }
@@ -79,62 +81,111 @@ InNumaPool::InNumaPool(int max_thread_num) {
   }
 }
 
-InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
-  printf("===========In NumaPool============\n");
+namespace {
+void bind_compute_thread(pthread_t thread, int cpu, const std::string& name) {
+  pthread_setname_np(thread, name.c_str());
+  const int mask_cpus = std::max(cpu + 1, CPU_SETSIZE);
+  const size_t mask_size = CPU_ALLOC_SIZE(mask_cpus);
+  auto* mask = CPU_ALLOC(mask_cpus);
+  if (!mask) throw std::bad_alloc();
+  CPU_ZERO_S(mask_size, mask);
+  CPU_SET_S(cpu, mask_size, mask);
+  const int rc = pthread_setaffinity_np(thread, mask_size, mask);
+  CPU_FREE(mask);
+  if (rc != 0) {
+    throw std::runtime_error("Failed to bind " + name + " to CPU " + std::to_string(cpu) + ": " + strerror(rc));
+  }
+  configure_moe_realtime(thread, name.c_str());
+}
+}  // namespace
+
+namespace {
+std::vector<std::vector<int>> resolve_pool_cpus(const std::vector<int>& numa_nodes,
+                                               const std::vector<int>& thread_counts, bool inventory) {
+  if (numa_nodes.empty() || (!inventory && numa_nodes.size() != thread_counts.size())) {
+    throw std::invalid_argument("CPUInfer requires a NUMA node and thread count for every pool");
+  }
   hwloc_topology_t topology;
-  hwloc_obj_t numa_obj, core_obj;
-  hwloc_bitmap_t cpuset;
-  hwloc_topology_init(&topology);
-  hwloc_topology_load(topology);
-  printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
-  total_worker_count = max_thread_num;
+  if (hwloc_topology_init(&topology) != 0) throw std::runtime_error("Cannot initialize CPU topology");
+  auto topology_owner = std::unique_ptr<std::remove_pointer_t<hwloc_topology_t>, decltype(&hwloc_topology_destroy)>(
+      topology, hwloc_topology_destroy);
+  if (hwloc_topology_load(topology) != 0) throw std::runtime_error("Cannot load CPU topology");
+  auto allowed = std::unique_ptr<std::remove_pointer_t<hwloc_bitmap_t>, decltype(&hwloc_bitmap_free)>(
+      hwloc_bitmap_alloc(), hwloc_bitmap_free);
+  auto candidates = std::unique_ptr<std::remove_pointer_t<hwloc_bitmap_t>, decltype(&hwloc_bitmap_free)>(
+      hwloc_bitmap_alloc(), hwloc_bitmap_free);
+  if (!allowed || !candidates || hwloc_get_cpubind(topology, allowed.get(), HWLOC_CPUBIND_THREAD) != 0) {
+    throw std::runtime_error("Cannot read CPUInfer effective CPU affinity");
+  }
+
+  std::map<int, int> next_core;
+  std::vector<std::vector<int>> pools;
+  for (size_t i = 0; i < numa_nodes.size(); ++i) {
+    const int node_id = numa_nodes[i];
+    const int count = inventory ? 0 : thread_counts[i];
+    const auto node = get_numa_node(topology, node_id);
+    if (inventory && !node) {
+      pools.emplace_back();
+      continue;
+    }
+    if (!node || (!inventory && count <= 0)) {
+      throw std::invalid_argument("Invalid CPUInfer pool: NUMA " + std::to_string(node_id) +
+                                  ", threads " + std::to_string(count));
+    }
+    auto& index = next_core.try_emplace(node_id, moe_core_index(0)).first->second;
+    auto& cpus = pools.emplace_back();
+    while (inventory || cpus.size() < static_cast<size_t>(count)) {
+      const auto core = hwloc_get_obj_inside_cpuset_by_type(topology, node->cpuset, HWLOC_OBJ_CORE, index++);
+      if (!core) {
+        if (inventory) break;
+        throw std::invalid_argument("Insufficient eligible physical cores for CPUInfer on NUMA " +
+                                    std::to_string(node_id) + " (pool requested " +
+                                    std::to_string(count) + " threads; found " + std::to_string(cpus.size()) + ")");
+      }
+      hwloc_bitmap_and(candidates.get(), core->cpuset, allowed.get());
+      hwloc_bitmap_and(candidates.get(), candidates.get(), node->cpuset);
+      const int cpu = hwloc_bitmap_first(candidates.get());
+      if (cpu >= 0) cpus.push_back(cpu);
+    }
+  }
+  return pools;
+}
+}  // namespace
+
+std::vector<std::vector<int>> resolve_worker_pool_cpus(const std::vector<int>& numa_nodes,
+                                                       const std::vector<int>& thread_counts) {
+  return resolve_pool_cpus(numa_nodes, thread_counts, false);
+}
+
+std::vector<std::vector<int>> available_worker_pool_cpus(const std::vector<int>& numa_nodes) {
+  return resolve_pool_cpus(numa_nodes, {}, true);
+}
+
+InNumaPool::InNumaPool(const std::vector<int>& cpus, int numa_id, int threads_id_start) {
+  total_worker_count = static_cast<int>(cpus.size());
   set_restricted_worker_count(total_worker_count);
-  thread_state_ = std::unique_ptr<ThreadState[]>(new ThreadState[max_thread_num]);
+  thread_state_ = std::make_unique<ThreadState[]>(total_worker_count);
+  workers_.resize(total_worker_count);
   for (int i = 0; i < total_worker_count; i++) {
     thread_state_[i].status.store(ThreadStatus::WAITING, std::memory_order_release);
   }
-  workers_.resize(total_worker_count);
-  for (int i = 1; i < total_worker_count; i++) {
-    workers_[i] = std::thread(&InNumaPool::worker_thread, this, i, numa_id);
-    // set the thread name as: "numa_(numa_id)_t_(i+threads_id_start)"
-    std::string thread_name = "numa_" + std::to_string(numa_id) + "_t_" + std::to_string(i + threads_id_start);
-    pthread_t native_handle = workers_[i].native_handle();
-    auto res_set_name = pthread_setname_np(native_handle, thread_name.c_str());
-    if (res_set_name != 0) {
-      fprintf(stderr, "Failed to set thread name: %s\n", strerror(res_set_name));
+  try {
+    for (int i = 1; i < total_worker_count; i++) {
+      workers_[i] = std::thread(&InNumaPool::worker_thread, this, i, numa_id);
+      const std::string name = "numa_" + std::to_string(numa_id) + "_t_" + std::to_string(i + threads_id_start);
+      bind_compute_thread(workers_[i].native_handle(), cpus[i], name);
     }
-    // 检查线程是否成功命名
-    char name[16];
-    pthread_getname_np(native_handle, name, sizeof(name));
-    if (strcmp(name, thread_name.c_str()) == 0) {
-      // printf("Thread name set successfully: %s\n", name);
-    } else {
-      // printf("Failed to set thread name: %s\n", name);
-    }
-    // Set the thread affinity to the specified NUMA node's CPU
-    numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, numa_id);
-    if (!numa_obj) {
-      fprintf(stderr, "NUMA node %d not found\n", numa_id);
-      // throw std::runtime_error("NUMA node not found");
-      continue;
-    }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, moe_core_index(i + threads_id_start));
-    if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
-      throw std::runtime_error("MoE affinity core index outside NUMA node");
-    }
-    cpuset = hwloc_bitmap_alloc();
-    hwloc_bitmap_copy(cpuset, core_obj->cpuset);
-    hwloc_bitmap_singlify(cpuset);
-    auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset, HWLOC_CPUBIND_STRICT);
-    if (res != 0) {
-      fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
-    }
-    if (res == 0) configure_moe_realtime(native_handle, thread_name.c_str());
+  } catch (...) {
+    stop_workers();
+    throw;
   }
 }
 
 InNumaPool::~InNumaPool() {
+  stop_workers();
+}
+
+void InNumaPool::stop_workers() {
   for (int i = 0; i < total_worker_count; i++) {
     {
       std::lock_guard<std::mutex> lock(thread_state_[i].mutex);
@@ -384,8 +435,8 @@ NumaJobDistributor::NumaJobDistributor(int numa_count) {
 }
 
 NumaJobDistributor::NumaJobDistributor(std::vector<int> numa_ids) { init(numa_ids); }
-NumaJobDistributor::NumaJobDistributor(std::vector<int> numa_ids, std::vector<int> thread_count) {
-  init(numa_ids, thread_count);
+NumaJobDistributor::NumaJobDistributor(std::vector<int> numa_ids, const std::vector<std::vector<int>>& pool_cpus) {
+  init(numa_ids, pool_cpus);
 }
 
 void NumaJobDistributor::init(std::vector<int> numa_ids) {
@@ -405,13 +456,7 @@ void NumaJobDistributor::init(std::vector<int> numa_ids) {
   ready_bar->arrive_and_wait();
 }
 
-void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread_count) {
-  hwloc_topology_t topology;
-  hwloc_obj_t numa_obj, core_obj;
-  hwloc_bitmap_t cpuset;
-  hwloc_topology_init(&topology);
-  hwloc_topology_load(topology);
-
+void NumaJobDistributor::init(std::vector<int> numa_ids, const std::vector<std::vector<int>>& pool_cpus) {
   this->numa_count = numa_ids.size();
   this->ready_bar = std::unique_ptr<std::barrier<>>(new std::barrier<>(numa_count + 1));
   this->numa_ids = numa_ids;
@@ -423,53 +468,34 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
 
   workers.resize(numa_count);
   std::map<int, int> numa_threads_count;
-  for (int i = 0; i < numa_count; i++) {
-    workers[i] = std::thread(&NumaJobDistributor::worker_thread, this, i);
-    auto this_numa = numa_ids[i];
-    auto start_id = numa_threads_count[this_numa];
-    // set the thread name as: "worker_numa_(numa_id)_main_start_id(0)"
-    // printf("nuam_id %d, start_id %d\n", this_numa, start_id);
-    std::string thread_name = "numa_" + std::to_string(numa_ids[i]) + "_m_" + std::to_string(start_id);
-    pthread_t native_handle = workers[i].native_handle();
-    pthread_setname_np(native_handle, thread_name.c_str());
-    // Set the thread affinity to the specified NUMA node's CPU (0)
-    numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, this_numa);
-    if (!numa_obj) {
-      fprintf(stderr, "NUMA node %d not found\n", this_numa);
-      // throw std::runtime_error("NUMA node not found");
-      continue;
+  int started = 0;
+  try {
+    while (started < numa_count) {
+      const int i = started;
+      const int node = numa_ids[i];
+      const int start_id = numa_threads_count[node];
+      workers[i] = std::thread(&NumaJobDistributor::worker_thread, this, i);
+      ++started;
+      const std::string name = "numa_" + std::to_string(node) + "_m_" + std::to_string(start_id);
+      bind_compute_thread(workers[i].native_handle(), pool_cpus[i].front(), name);
+      numa_threads_count[node] += static_cast<int>(pool_cpus[i].size());
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, moe_core_index(start_id));
-    if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", 0, this_numa);
-      throw std::runtime_error("MoE affinity core index outside NUMA node");
-    }
-    // 精简 cpuset
-    auto cpuset_simple = hwloc_bitmap_alloc();
-    hwloc_bitmap_copy(cpuset_simple, core_obj->cpuset);
-    hwloc_bitmap_singlify(cpuset_simple);
-    // 打印绑定的具体的 CPU 物理索引
-    unsigned long i_in;
-    // hwloc_bitmap_foreach_begin(i_in, cpuset_simple) { printf("Thread %d bound to CPU %ld\n", start_id, i_in); }
-    // hwloc_bitmap_foreach_end();
-    auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset_simple, HWLOC_CPUBIND_STRICT);
-    if (res != 0) {
-      fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
-    }
-    if (res == 0) configure_moe_realtime(native_handle, thread_name.c_str());
-    // 检查线程是否绑定到指定的 核上了
-    hwloc_cpuset_t cpuset = hwloc_bitmap_alloc();
-    hwloc_get_thread_cpubind(topology, native_handle, cpuset, HWLOC_CPUBIND_THREAD);
-    // hwloc_bitmap_foreach_begin(i_in, cpuset) { printf("Thread %d is bound to CPU %ld\n", start_id, i_in); }
-    // hwloc_bitmap_foreach_end();
-
-    numa_threads_count[this_numa] += thread_count[i];
+  } catch (...) {
+    for (int i = started; i < numa_count; ++i) ready_bar->arrive_and_drop();
+    ready_bar->arrive_and_wait();
+    stop_workers();
+    throw;
   }
   ready_bar->arrive_and_wait();
 }
 
 NumaJobDistributor::~NumaJobDistributor() {
+  stop_workers();
+}
+
+void NumaJobDistributor::stop_workers() {
   for (int i = 0; i < numa_count; i++) {
+    if (!workers[i].joinable()) continue;
     {
       std::lock_guard<std::mutex> lock(*mutexes[i]);
       status[i]->store(ThreadStatus::EXIT, std::memory_order_release);
@@ -554,32 +580,45 @@ void NumaJobDistributor::worker_thread(int numa_id) {
 }
 
 void WorkerPool::init(WorkerPoolConfig config) {
-  printf("WorkerPool[0x%lx] %d subpools, [numa:threads]", (intptr_t)this, config.subpool_count);
-  for (int i = 0; i < config.subpool_count; i++) {
-    printf("[%d:%d] ", config.subpool_numa_map[i], config.subpool_thread_count[i]);
+  if (config.subpool_count <= 0 || static_cast<size_t>(config.subpool_count) != config.subpool_numa_map.size()) {
+    throw std::invalid_argument("CPUInfer subpool_count must match the NUMA configuration");
   }
-  printf("\n");
-
-  for (int i = 0; i < config.subpool_count; i++) {
-    numa_worker_pools.push_back(nullptr);
+  auto pool_cpus = config.subpool_cpus;
+  if (pool_cpus.empty()) {
+    pool_cpus = resolve_worker_pool_cpus(config.subpool_numa_map, config.subpool_thread_count);
+  } else {
+    if (pool_cpus.size() != config.subpool_numa_map.size() || pool_cpus.size() != config.subpool_thread_count.size()) {
+      throw std::invalid_argument("Explicit CPUInfer placement must specify CPUs for every pool");
+    }
+    std::vector<int> selected;
+    for (size_t i = 0; i < pool_cpus.size(); ++i) {
+      const auto available = available_worker_pool_cpus({config.subpool_numa_map[i]});
+      if (pool_cpus[i].empty() || pool_cpus[i].size() != static_cast<size_t>(config.subpool_thread_count[i])) {
+        throw std::invalid_argument("Explicit CPUInfer placement does not match the thread count");
+      }
+      for (int cpu : pool_cpus[i]) {
+        if (std::find(available[0].begin(), available[0].end(), cpu) == available[0].end() ||
+            std::find(selected.begin(), selected.end(), cpu) != selected.end()) {
+          throw std::invalid_argument("CPUInfer placement is no longer eligible: CPU " + std::to_string(cpu));
+        }
+        selected.push_back(cpu);
+      }
+    }
   }
+  numa_worker_pools.reserve(config.subpool_count);
   std::map<int, int> numa_threads_count;
   for (int i = 0; i < config.subpool_count; i++) {
-    auto this_numa = config.subpool_numa_map[i];
-    auto this_thread_count = config.subpool_thread_count[i];
-    auto this_thread_id_start = numa_threads_count[this_numa];
-    std::thread([this, i, this_numa, this_thread_count, this_thread_id_start]() {
-      set_to_numa(this_numa);
-      numa_worker_pools[i] =
-          std::move(std::unique_ptr<InNumaPool>(new InNumaPool(this_thread_count, this_numa, this_thread_id_start)));
-      // numa_worker_pools[i] = std::move(std::unique_ptr<InNumaPool>(new InNumaPool(this_thread_count)));
-    }).join();
-    numa_threads_count[this_numa] += this_thread_count;
+    const int node = config.subpool_numa_map[i];
+    const int start_id = numa_threads_count[node];
+    // Keep NUMA allocation policy changes on a temporary thread.
+    auto pool = std::async(std::launch::async, [&, node, start_id, i] {
+      set_to_numa(node);
+      return std::make_unique<InNumaPool>(pool_cpus[i], node, start_id);
+    });
+    numa_worker_pools.push_back(pool.get());
+    numa_threads_count[node] += static_cast<int>(pool_cpus[i].size());
   }
-
-  distributor = std::move(std::unique_ptr<NumaJobDistributor>(
-      new NumaJobDistributor(config.subpool_numa_map, config.subpool_thread_count)));
-  // distributor = std::move(std::unique_ptr<NumaJobDistributor>(new NumaJobDistributor(config.subpool_numa_map)));
+  distributor = std::make_unique<NumaJobDistributor>(config.subpool_numa_map, pool_cpus);
 }
 
 WorkerPool::WorkerPool(WorkerPoolConfig config) : config(config) { init(config); }
