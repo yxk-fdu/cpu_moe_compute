@@ -12,6 +12,11 @@
 #include "../../cpu_backend/cpu_compute_trace.h"
 #include "mxfp8_match.h"
 #include "nz_moe_kernels.hpp"
+
+#if defined(__aarch64__) && defined(KT_NZ_SVE256) && defined(_OPENMP)
+#include <omp.h>
+#include <pthread.h>
+#endif
 #if defined(__AVX512BF16__) && defined(__AVX512F__)
 #include "nz_moe_x86.hpp"
 #endif
@@ -27,6 +32,9 @@ class MoE {
   int layer_, hidden_, intermediate_, topk_, max_tokens_;
   std::vector<std::vector<uintptr_t>> sources_;
   std::vector<float> input_;
+#if defined(__aarch64__) && defined(KT_NZ_SVE256) && defined(_OPENMP)
+  std::vector<float> grouped_gate_, grouped_down_;
+#endif
   std::vector<uint16_t> packed_input_, gates_, down_;
   struct Work { int expert, first, count; };
   std::vector<Work> work_;
@@ -100,6 +108,127 @@ class MoE {
     }
     return active;
   }
+
+#if defined(__aarch64__) && defined(KT_NZ_SVE256) && defined(_OPENMP)
+  void run_grouped_forward(InNumaPool& pool, int k, int tokens, int active,
+                         const int64_t* ids, const float* routes, uint16_t* output) {
+    grouped_gate_.resize(size_t(active)*2*intermediate_);
+    grouped_down_.resize(size_t(active)*hidden_);
+    const int threads=std::min(pool.get_restricted_worker_count(),
+                               pool_->config.subpool_thread_count[0]);
+    const auto& cpus=pool_->config.subpool_cpus[0];
+    #pragma omp parallel num_threads(threads)
+    {
+      const int thread=omp_get_thread_num();
+      const int threads=omp_get_num_threads();
+      static thread_local int bound_cpu=-1;
+      if (bound_cpu!=cpus[thread]) {
+        cpu_set_t mask;CPU_ZERO(&mask);CPU_SET(cpus[thread],&mask);
+        if (pthread_setaffinity_np(pthread_self(),sizeof(mask),&mask)) std::abort();
+        bound_cpu=cpus[thread];
+      }
+      // SVE vector length is thread-local and is stable during this forward.
+      // Use the ARM helper's cached thread selection; retain other architectures.
+      const bool use_sve=arm::sve256_supported();
+      auto prepare_local = [&](float* values, uint16_t* packed, int size) {
+        if (use_sve) { sve256::prepare(values,packed,size); return; }
+        prepare(values,packed,size);
+      };
+      auto project_local = [&](const uint8_t* w,const uint8_t* scales,int n,int groups,
+                               int first,int rows,const InputTile& x,const OutputTile& y,int tokens) {
+        if (use_sve) { sve256::project(w,scales,n,groups,first,rows,x,y,tokens); return; }
+        project(w,scales,n,groups,first,rows,x,y,tokens);
+      };
+      // Fixed row ownership avoids redispatching each dependent stage.
+      auto project_rows = [&](bool gate_up) {
+        const int n = gate_up ? 2*intermediate_ : hidden_;
+        const int dim = gate_up ? hidden_ : intermediate_;
+        const int first = int(int64_t(n/4)*thread/threads)*4;
+        const int end = int(int64_t(n/4)*(thread+1)/threads)*4;
+        for (const auto& group : work_) {
+          InputTile input{};
+          for (int i=0; i<group.count; ++i) {
+            const int slot = group.first+i;
+            input[i] = gate_up
+                ? packed_input_.data()+size_t(expert_routes_[slot]/k)*hidden_
+                : gates_.data()+size_t(slot)*2*intermediate_;
+          }
+          const int field = gate_up ? 0 : 1;
+          for (int row=first; row<end; row+=kRowsPerJob) {
+            const int count=std::min(kRowsPerJob,end-row);
+            auto& destination=gate_up?grouped_gate_:grouped_down_;
+            OutputTile result{};
+            for (int i=0; i<group.count; ++i)
+              result[i]=destination.data()+size_t(group.first+i)*n+row;
+            project_local(reinterpret_cast<const uint8_t*>(sources_[field][group.expert]),
+                          reinterpret_cast<const uint8_t*>(sources_[field+2][group.expert]),
+                          n,dim/32,row,count,input,result,group.count);
+          }
+        }
+      };
+      project_rows(true);
+      #pragma omp barrier
+      const int blocks=intermediate_/32;
+      const auto* down_prefetch = work_.size() == 1 && blocks >= 4
+          ? reinterpret_cast<const uint8_t*>(sources_[1][work_.front().expert]) : nullptr;
+      const size_t down_group_stride = size_t(hidden_) * 16;
+      for (int task=thread; task<active*blocks; task+=threads) {
+        // Prefetch each weight segment once for all tokens sharing this expert.
+        if (down_prefetch && task < blocks) {
+          const int first_row = int(int64_t(hidden_) * task / blocks);
+          const int end_row = int(int64_t(hidden_) * (task + 1) / blocks);
+          for (int group=0; group<4; ++group) {
+            const auto* start = down_prefetch + size_t(group) * down_group_stride + size_t(first_row) * 16;
+            for (int row=first_row; row<end_row; row+=4)
+              asm volatile("prfm pldl2keep, [%0]" :: "r"(start + size_t(row-first_row) * 16));
+          }
+        }
+        const auto* g=grouped_gate_.data()+size_t(task/blocks)*2*intermediate_+(task%blocks)*32;
+        auto* packed=gates_.data()+size_t(task/blocks)*2*intermediate_+(task%blocks)*32;
+        const auto* u=g+intermediate_;
+        if (use_sve) { sve256::activate(g,u,packed,32); continue; }
+        std::array<float,32> activation;
+        for (int j=0; j<32; ++j) {
+          const float gv=std::min(kt_match_npu::bf16(g[j]),10.f);
+          const float uv=std::max(-10.f,std::min(kt_match_npu::bf16(u[j]),10.f));
+          activation[j]=kt_match_npu::bf16((gv/(1.f+expf(-gv)))*uv);
+        }
+        prepare_local(activation.data(),packed,32);
+      }
+      #pragma omp barrier
+      project_rows(false);
+      #pragma omp barrier
+      const int chunks=(hidden_+255)/256;
+      for (int task=thread; task<tokens*chunks; task+=threads) {
+        const int t=task/chunks, begin=(task%chunks)*256;
+        const int len=std::min(256,hidden_-begin);
+        if (use_sve) {
+          std::array<const float*,8> values{};
+          std::array<float,8> scores{};
+          int valid=0;
+          for (int route=0; route<k; ++route) {
+            const int index=t*k+route;
+            if (ids[index]<0) continue;
+            values[valid]=grouped_down_.data()+size_t(route_slot_[index])*hidden_+begin;
+            scores[valid++]=routes[index];
+          }
+          sve256::combine(values.data(),scores.data(),valid,output+size_t(t)*hidden_+begin,len);
+          continue;
+        }
+        std::array<float,256> sum{};
+        for (int route=0; route<k; ++route) {
+          const int index=t*k+route;
+          if (ids[index]<0) continue;
+          const auto* d=grouped_down_.data()+size_t(route_slot_[index])*hidden_+begin;
+          const float score=kt_match_npu::bf16(routes[index]);
+          for (int j=0; j<len; ++j) sum[j]+=kt_match_npu::bf16(d[j])*score;
+        }
+        for (int j=0; j<len; ++j) output[size_t(t)*hidden_+begin+j]=to_bf16(sum[j]);
+      }
+    }
+  }
+
+#endif
 
   void run_projection(InNumaPool& pool, int k, bool gate_up) {
     const int n=gate_up?2*intermediate_:hidden_;
@@ -204,14 +333,26 @@ class MoE {
     if (gates_.size()<gate_size) gates_.resize(gate_size);
     if (down_.size()<down_size) down_.resize(down_size);
 
-    pool_->dispense_backend()->do_numa_job([&](int part) {
-      auto* sub=pool_->get_subpool(part);
+    const auto prepare_inputs = [&] {
       for (int t=0; t<tokens; ++t) {
         const auto* first=ids+t*k;
         if (std::all_of(first,first+k,[](int64_t id){return id<0;})) continue;
         for (int i=0; i<hidden_; ++i) input_[i]=from_bf16(input[size_t(t)*hidden_+i]);
         prepare(input_.data(),packed_input_.data()+size_t(t)*hidden_,hidden_);
       }
+    };
+#if defined(__aarch64__) && defined(KT_NZ_SVE256) && defined(_OPENMP)
+    if (arm::sve256_supported() && k<=8 && !pool_->config.subpool_cpus.empty() &&
+        std::all_of(pool_->config.subpool_cpus[0].begin(), pool_->config.subpool_cpus[0].end(),
+                    [](int cpu) { return cpu>=0 && cpu<CPU_SETSIZE; })) {
+      prepare_inputs();
+      run_grouped_forward(*pool_->get_subpool(0),k,tokens,active,ids,routes,output);
+      return;
+    }
+#endif
+    pool_->dispense_backend()->do_numa_job([&](int part) {
+      auto* sub=pool_->get_subpool(part);
+      prepare_inputs();
       run_projection(*sub,k,true);
       const int blocks=intermediate_/32;
       sub->do_work_stealing_job(active*blocks,[&](int task) {

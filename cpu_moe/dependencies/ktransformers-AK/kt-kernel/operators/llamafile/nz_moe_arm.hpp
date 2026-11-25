@@ -44,7 +44,7 @@ inline bool sve256_supported() {
 
 namespace kt_nz::arm {
 
-struct alignas(16) WeightTable {
+struct alignas(64) WeightTable {
   uint16_t scale[256][16];
 
   WeightTable() {

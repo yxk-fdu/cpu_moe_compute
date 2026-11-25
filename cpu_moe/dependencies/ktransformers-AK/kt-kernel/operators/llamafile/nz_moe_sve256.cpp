@@ -158,11 +158,164 @@ void project_rows(const uint8_t* weights,const uint8_t* scales,int n,int groups,
         }
     }
 }
+inline Activation256 load_activation_deinterleaved(const uint16_t* input) {
+    const auto all = svptrue_b16();
+    const auto pair = svld2_bf16(all, reinterpret_cast<const bfloat16_t*>(input));
+    return {svget2_bf16(pair, 0), svget2_bf16(pair, 1)}; // lo=even, hi=odd
+}
+
+inline Activation256 decode_sve_nozip(const uint8_t* src, const uint16_t* table) {
+    const auto all = svptrue_b16();
+    const auto weights = svld1ub_u16(all, src);
+    const auto lut = svld1_u16(all, table);
+    const auto hi = svlsr_n_u16_x(all, weights, 4);
+    const auto lo = svand_n_u16_x(all, weights, 15);
+    return {svreinterpret_bf16_u16(svtbl_u16(lut, lo)),  // even weights
+            svreinterpret_bf16_u16(svtbl_u16(lut, hi))}; // odd weights
+}
+
+inline void accumulate_exact_nozip(VecF32& acc_b, VecF32& acc_t,
+                                   const Activation256& w, const Activation256& x) {
+    acc_b = svbfmlalb_f32(svbfmlalb_f32(acc_b, w.hi, x.hi), w.lo, x.lo);
+    acc_t = svbfmlalt_f32(svbfmlalt_f32(acc_t, w.hi, x.hi), w.lo, x.lo);
+}
+
+template<>
+void project_rows<1>(const uint8_t* weights, const uint8_t* scales, int n, int groups,
+                     int first, int rows, const InputTile& x, const OutputTile& y) {
+    static const arm::WeightTable table;
+    std::array<Sums256<1>, kRowsPerJob> sums;
+    std::fill_n(sums.begin(), rows, Sums256<1>{});
+    constexpr int kGroups = 4;
+    const size_t stride = size_t(n) * 16;
+    const uint16_t* x0 = x[0];
+    if (groups >= kGroups) {
+        const auto* initial = weights + size_t(first) * 16;
+        const int bytes = std::min(512, rows * 16);
+        for (int k = 0; k < kGroups; ++k) {
+            const auto* group = initial + size_t(k) * stride;
+            for (int offset = 0; offset < bytes; offset += 64)
+                asm volatile("prfm pldl2keep, [%0]" :: "r"(group + offset));
+        }
+    }
+
+    for (int g = 0; g < groups; g += kGroups) {
+        const auto* w0 = weights + (size_t(g) * n + first) * 16;
+        const auto* s = scales + size_t(first) * groups + g;
+        const int chunk = std::min(kGroups, groups - g);
+
+        if (chunk == 4) {
+            const auto* w1 = w0 + stride;
+            const auto* w2 = w0 + 2 * stride;
+            const auto* w3 = w0 + 3 * stride;
+            const auto a0 = load_activation_deinterleaved(x0 + (g + 0) * 32);
+            const auto a1 = load_activation_deinterleaved(x0 + (g + 1) * 32);
+            const auto a2 = load_activation_deinterleaved(x0 + (g + 2) * 32);
+            const auto a3 = load_activation_deinterleaved(x0 + (g + 3) * 32);
+
+            const bool do_pf = g + 2 * kGroups <= groups;
+
+            const bool prefetch_scales = (g & 63) == 0;
+            int row = 0;
+            for (; row + 2 <= rows; row += 2) {
+                if (do_pf && ((row & 3) == 0)) {
+                    const auto* pf0 = w0 + 4 * stride;
+                    const auto* pf1 = pf0 + stride;
+                    const auto* pf2 = pf0 + 2 * stride;
+                    const auto* pf3 = pf0 + 3 * stride;
+                    asm volatile("prfm pldl2keep, [%0]" :: "r"(pf0 + row * 16));
+                    asm volatile("prfm pldl2keep, [%0]" :: "r"(pf1 + row * 16));
+                    asm volatile("prfm pldl2keep, [%0]" :: "r"(pf2 + row * 16));
+                    asm volatile("prfm pldl2keep, [%0]" :: "r"(pf3 + row * 16));
+                }
+                if ((row & 3) == 0 && row + 16 < rows) {
+                    const int offset = (row + 16) * 16;
+                    asm volatile("prfm pldl1keep, [%0]" :: "r"(w0 + offset));
+                    asm volatile("prfm pldl1keep, [%0]" :: "r"(w1 + offset));
+                    asm volatile("prfm pldl1keep, [%0]" :: "r"(w2 + offset));
+                    asm volatile("prfm pldl1keep, [%0]" :: "r"(w3 + offset));
+                }
+                if (prefetch_scales && row + 9 < rows) {
+                    const auto* next_scale = s + size_t(row + 8) * groups;
+                    asm volatile("prfm pldl2keep, [%0]" :: "r"(next_scale));
+                    asm volatile("prfm pldl2keep, [%0]" :: "r"(next_scale + groups));
+                }
+                auto b0 = sums[row].lo[0],     t0 = sums[row].hi[0];
+                auto b1 = sums[row + 1].lo[0], t1 = sums[row + 1].hi[0];
+                const auto* sr0 = s + size_t(row) * groups;
+                const auto* sr1 = sr0 + groups;
+                accumulate_exact_nozip(b0, t0, decode_sve_nozip(w0 + row * 16,      table.scale[sr0[0]]), a0);
+                accumulate_exact_nozip(b1, t1, decode_sve_nozip(w0 + row * 16 + 16, table.scale[sr1[0]]), a0);
+                accumulate_exact_nozip(b0, t0, decode_sve_nozip(w1 + row * 16,      table.scale[sr0[1]]), a1);
+                accumulate_exact_nozip(b1, t1, decode_sve_nozip(w1 + row * 16 + 16, table.scale[sr1[1]]), a1);
+                accumulate_exact_nozip(b0, t0, decode_sve_nozip(w2 + row * 16,      table.scale[sr0[2]]), a2);
+                accumulate_exact_nozip(b1, t1, decode_sve_nozip(w2 + row * 16 + 16, table.scale[sr1[2]]), a2);
+                accumulate_exact_nozip(b0, t0, decode_sve_nozip(w3 + row * 16,      table.scale[sr0[3]]), a3);
+                accumulate_exact_nozip(b1, t1, decode_sve_nozip(w3 + row * 16 + 16, table.scale[sr1[3]]), a3);
+                sums[row].lo[0]     = b0; sums[row].hi[0]     = t0;
+                sums[row + 1].lo[0] = b1; sums[row + 1].hi[0] = t1;
+            }
+            for (; row < rows; ++row) {
+                auto b = sums[row].lo[0], t = sums[row].hi[0];
+                const auto* sr = s + size_t(row) * groups;
+                accumulate_exact_nozip(b, t, decode_sve_nozip(w0 + row * 16, table.scale[sr[0]]), a0);
+                accumulate_exact_nozip(b, t, decode_sve_nozip(w1 + row * 16, table.scale[sr[1]]), a1);
+                accumulate_exact_nozip(b, t, decode_sve_nozip(w2 + row * 16, table.scale[sr[2]]), a2);
+                accumulate_exact_nozip(b, t, decode_sve_nozip(w3 + row * 16, table.scale[sr[3]]), a3);
+                sums[row].lo[0] = b; sums[row].hi[0] = t;
+            }
+        } else {
+            // Keep the same accumulator order for an incomplete K group.
+            for (int k = 0; k < chunk; ++k) {
+                const auto a = load_activation_deinterleaved(x0 + (g + k) * 32);
+                const auto* wk = w0 + size_t(k) * stride;
+                for (int row = 0; row < rows; ++row) {
+                    const auto exp = s[size_t(row) * groups + k];
+                    accumulate_exact_nozip(sums[row].lo[0], sums[row].hi[0],
+                                           decode_sve_nozip(wk + row * 16, table.scale[exp]), a);
+                }
+            }
+        }
+    }
+
+    for (int r = 0; r < rows; ++r) {
+        const auto lo = svzip1_f32(sums[r].lo[0], sums[r].hi[0]);
+        const auto hi = svzip2_f32(sums[r].lo[0], sums[r].hi[0]);
+        y[0][r] = reduce256_single_token(lo, hi);
+    }
+}
+
 }  // namespace
 
 void prepare(float* input,uint16_t* packed,int size) {
     quant_sve(input,size);
     pack_input(input,packed,size);
+}
+
+void activate(const float* gate, const float* up, uint16_t* packed, int size) {
+    std::array<float,32> values;
+    for (int first=0; first<size; first+=32) {
+        for (int j=0; j<32; ++j) {
+            const float g=std::min(kt_match_npu::bf16(gate[first+j]),10.f);
+            const float u=std::max(-10.f,std::min(kt_match_npu::bf16(up[first+j]),10.f));
+            values[j]=kt_match_npu::bf16((g/(1.f+expf(-g)))*u);
+        }
+        prepare(values.data(),packed+first,32);
+    }
+}
+
+void combine(const float* const* values, const float* scores, int routes,
+             uint16_t* output, int size) {
+    std::array<float,256> sum{};
+    for (int route=0; route<routes; ++route) {
+        const float score=kt_match_npu::bf16(scores[route]);
+        for (int j=0; j<size; ++j) sum[j]+=kt_match_npu::bf16(values[route][j])*score;
+    }
+    for (int j=0; j<size; ++j) {
+        const float value=kt_match_npu::bf16(sum[j]);
+        uint32_t bits; std::memcpy(&bits,&value,sizeof(bits));
+        output[j]=bits>>16;
+    }
 }
 
 void project(const uint8_t* w,const uint8_t* s,int n,int groups,int first,int rows,
